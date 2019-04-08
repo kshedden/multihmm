@@ -138,14 +138,14 @@ func (combi *combinator) enumerateWithFixedState(caps []int, fixpos, fixval int)
 
 	for {
 		// Handle the current state vector
+		ix := combi.copy(state)
 		if combi.constraint(state, combi.mask) == 0 {
 			// The constraint is satisfied
-			rv = append(rv, combiRec{combi.getScore(state), combi.copy(state)})
-			h := combi.hashix(state)
+			rv = append(rv, combiRec{combi.getScore(ix), ix})
+			h := combi.hashix(ix)
 			combi.seen[h] = true
 		} else {
 			// The constraint is not satisfied
-			ix := combi.copy(state)
 			if combi.project(ix, caps) {
 				rv = append(rv, combiRec{combi.getScore(ix), ix})
 			}
@@ -170,7 +170,6 @@ func (combi *combinator) enumerateWithFixedState(caps []int, fixpos, fixval int)
 			// states have been visited.
 			break
 		}
-
 	}
 
 	sort.Sort(crecv(rv))

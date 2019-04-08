@@ -20,6 +20,9 @@ const (
 type MultiHMM struct {
 	HMM
 
+	// Group[k] lists all the particles that are reconstructed jointly
+	Group [][]int
+
 	// The forward probabilities
 	fpr []float64
 
@@ -50,8 +53,10 @@ func NewMulti(NParticle, NState, NTime int) *MultiHMM {
 // that the multi-state Viterbi reconstruction can be applied.
 func (hmm *MultiHMM) InitializeMulti() {
 
-	if nkp > int(math.Pow(float64(hmm.NState), float64(hmm.NParticle))) {
-		panic("nkp is too large for NState and NParticle")
+	if float64(nkp) > math.Pow(float64(hmm.NState), float64(hmm.NParticle)) {
+		msg := fmt.Sprintf("nkp (%d) is too large for NState (%d) and NParticle (%d)", nkp,
+			hmm.NState, hmm.NParticle)
+		panic(msg)
 	}
 
 	hmm.Initialize()
@@ -442,25 +447,4 @@ func (hmm *MultiHMM) multiprob() {
 			lpx[jt+jj] = cr.ix
 		}
 	}
-}
-
-func resizeInt(x []int, m int) []int {
-	if cap(x) >= m {
-		return x[0:m]
-	}
-	return make([]int, m)
-}
-
-func resizeFloat(x []float64, m int) []float64 {
-	if cap(x) >= m {
-		return x[0:m]
-	}
-	return make([]float64, m)
-}
-
-func resizeInt2(x [][]int, m int) [][]int {
-	if cap(x) >= m {
-		return x[0:m]
-	}
-	return make([][]int, m)
 }
