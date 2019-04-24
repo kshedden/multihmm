@@ -3,6 +3,7 @@ package hmmlib
 import (
 	"encoding/binary"
 	"hash"
+	"hash/fnv"
 	"math/rand"
 	"sort"
 )
@@ -18,7 +19,7 @@ type combinator struct {
 
 	// topcap contains caps that bound the values that are produced by
 	// deterministic enumeration.  Particle p is never placed in state
-	// particle[p] or higher by deterministic enumeration.
+	// topcap[p] or higher by deterministic enumeration.
 	topcap []int
 
 	// constraint is a function that returns 0 if the constraint is met and
@@ -35,6 +36,9 @@ type combinator struct {
 	// seen[hashix[x]] is true iff the slic x has already been included in
 	// the enumeration
 	seen map[uint64]bool
+
+	// Workspace for project
+	prjwk []int
 }
 
 type crecv []combiRec
@@ -79,6 +83,18 @@ func (combi *combinator) getScore(ix []int) float64 {
 	return v
 }
 
+// NewCombinator returns a newly allocated combinator object, for the given parameters.
+func NewCombinator(obspr [][]float64, constraint func([]int, []bool) float64, mask []bool) *combinator {
+
+	return &combinator{
+		scores:     obspr,
+		constraint: constraint,
+		hash:       fnv.New64(),
+		mask:       mask,
+		prjwk:      make([]int, 0, len(mask)),
+	}
+}
+
 // copy creates a copy of the slice
 func (combi *combinator) copy(ix []int) []int {
 	ixc := make([]int, len(ix))
@@ -92,34 +108,33 @@ func (combi *combinator) project(ix, caps []int) bool {
 
 	nstate := len(combi.scores[0])
 
+	// Get indices of non-masked particles
+	prjwk := combi.prjwk[0:0]
+	for i, m := range combi.mask {
+		if !m {
+			prjwk = append(prjwk, i)
+		}
+	}
+
 	for iter := 0; iter < 5000; iter++ {
 
 		// Make a random move
-		var q int
-		success := false
-		for ixr := 0; ixr < 100; ixr++ {
-			q = rand.Int() % len(ix)
-			if combi.mask[q] {
-				continue
-			}
-			if ix[q] < combi.topcap[q] {
-				ix[q] = combi.topcap[q]
-			} else {
-				ix[q]++
-			}
-			if ix[q] >= nstate {
-				ix[q] = 0
-			}
-			success = true
-			break
+		q := prjwk[rand.Int()%len(prjwk)]
+
+		if ix[q] < combi.topcap[q] {
+			ix[q] = combi.topcap[q]
+		} else {
+			ix[q]++
 		}
-		if !success {
-			continue
+
+		if ix[q] >= nstate {
+			ix[q] = 0
 		}
 
 		if combi.constraint(ix, combi.mask) > 0 {
 			continue
 		}
+
 		ha := combi.hashix(ix)
 		if !combi.seen[ha] {
 			combi.seen[ha] = true
@@ -186,24 +201,30 @@ func (combi *combinator) enumerate(caps []int) []combiRec {
 	// Use this to avoid including the same state multiple times
 	combi.seen = make(map[uint64]bool)
 
-	return combi.enumerateHelper(caps)
+	h := combi.enumerateHelper(caps)
+	return h
 }
 
 func (combi *combinator) enumerateHelper(caps []int) []combiRec {
 
-	// caps cannot be zero
+	// Check validity of caps
 	for j := range caps {
-		if caps[j] < 1 {
+		if !combi.mask[j] && caps[j] < 1 {
 			panic("Invalid caps")
 		}
 	}
 
 	// Find a state whose range will be reduced by 1.
 	var jmx, mx int
+	first := true
 	for j := range caps {
-		if j == 0 || caps[j] > mx {
+		if combi.mask[j] {
+			continue
+		}
+		if first || caps[j] > mx {
 			jmx = j
 			mx = caps[j]
+			first = false
 		}
 	}
 
@@ -226,19 +247,19 @@ func (combi *combinator) enumerateHelper(caps []int) []combiRec {
 	crec2 := combi.enumerateWithFixedState(caps, jmx, mx-1)
 	caps[jmx]++
 
-	// Merge sort
+	// Merge
 	crec3 := make([]combiRec, len(crec1)+len(crec2))
 	for i := 0; len(crec1) > 0 || len(crec2) > 0; i++ {
 		switch {
 		case len(crec1) == 0:
 			crec3[i] = crec2[0]
-			crec2 = crec2[1:len(crec2)]
+			crec2 = crec2[1:]
 		case len(crec2) == 0 || crec1[0].score < crec2[0].score:
 			crec3[i] = crec1[0]
-			crec1 = crec1[1:len(crec1)]
+			crec1 = crec1[1:]
 		default:
 			crec3[i] = crec2[0]
-			crec2 = crec2[1:len(crec2)]
+			crec2 = crec2[1:]
 		}
 	}
 

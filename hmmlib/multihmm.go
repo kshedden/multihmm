@@ -2,18 +2,15 @@ package hmmlib
 
 import (
 	"fmt"
-	"hash/fnv"
+	"io"
 	"math"
 	"math/rand"
+	"os"
 	"sort"
+	"sync"
 
 	"github.com/schollz/progressbar"
 	"gonum.org/v1/gonum/floats"
-)
-
-const (
-	// Keep this many top-scoring configurations in the joint reconstruction
-	nkp = 50
 )
 
 // MultiHMM is an HMM that can do joint Viterbi reconstruction of the state sequences.
@@ -22,21 +19,6 @@ type MultiHMM struct {
 
 	// Group[k] lists all the particles that are reconstructed jointly
 	Group [][]int
-
-	// The forward probabilities
-	fpr []float64
-
-	// Traceback pointers
-	tbp []int
-
-	// The actual state sequence (for all the particles) at each traceback point
-	lpx [][]int
-
-	// Number of valid states for each time point
-	npt []int
-
-	// Workspace
-	cwk []int
 }
 
 // NewMulti returns a MultiHMM value with the given size parameters.
@@ -51,41 +33,50 @@ func NewMulti(NParticle, NState, NTime int) *MultiHMM {
 
 // InitializeMulti allocates workspaces for parameter estimation, so
 // that the multi-state Viterbi reconstruction can be applied.
-func (hmm *MultiHMM) InitializeMulti() {
+func (hmm *MultiHMM) InitializeMulti(nkp int) {
 
-	if float64(nkp) > math.Pow(float64(hmm.NState), float64(hmm.NParticle)) {
+	if math.Log(float64(nkp)) > float64(hmm.NParticle)*math.Log(float64(hmm.NState)) {
 		msg := fmt.Sprintf("nkp (%d) is too large for NState (%d) and NParticle (%d)", nkp,
 			hmm.NState, hmm.NParticle)
 		panic(msg)
 	}
 
-	hmm.Initialize()
+	hmm.msglogger.Printf("Group sizes:")
+	var mx int
+	for p, og := range hmm.Group {
+		if len(og) > mx {
+			mx = len(og)
+		}
+		hmm.msglogger.Printf("%4d  %8d\n", p, len(og))
+	}
 
-	hmm.fpr = make([]float64, hmm.NTime*nkp)
-	hmm.lpx = make([][]int, hmm.NTime*nkp)
-	hmm.tbp = make([]int, hmm.NTime*nkp)
-	hmm.npt = make([]int, hmm.NTime)
-
-	hmm.cwk = make([]int, hmm.NParticle)
+	if float64(mx) >= 0.9*float64(hmm.NState) {
+		msg := "There are too many particles to do a collision-avoiding fit."
+		_, _ = io.WriteString(os.Stderr, msg)
+	}
 }
 
 // Get all the observation probabilities at time t, sort them, and remove the states
 // that have low probability.
-func (hmm *MultiHMM) getMultiObsProb(t int, obspr [][]float64, inds [][]int, mask []bool) {
+func (hmm *MultiHMM) getMultiObsProb(t int, obsgrp []int, obspr [][]float64, inds [][]int, mask []bool) {
 
-	// Get the negative observation probabilities and sort them.  The first probability
-	// for each particle is always valid.
-	for p := 0; p < hmm.NParticle; p++ {
+	// Get the negative observation probabilities and sort them.
+	for j, p := range obsgrp {
 
-		mask[p] = hmm.Obs[p][t*hmm.NState] == NullObs
-		if mask[p] {
+		mask[j] = hmm.Obs[p][t*hmm.NState] == NullObs
+		if mask[j] {
 			continue
 		}
 
-		for st := 0; st < hmm.NState; st++ {
-			obspr[p][st] = -hmm.GetLogObsProb(p, t, st)
+		fprob := hmm.Fprob[p][t*hmm.NState : (t+1)*hmm.NState]
+		bprob := hmm.Bprob[p][t*hmm.NState : (t+1)*hmm.NState]
+		floats.MulTo(obspr[j], fprob, bprob)
+		normalizeSum(obspr[j], 0)
+		for i := range obspr[j] {
+			obspr[j][i] = -math.Log(obspr[j][i])
 		}
-		floats.Argsort(obspr[p], inds[p])
+
+		floats.Argsort(obspr[j], inds[j])
 	}
 }
 
@@ -98,27 +89,31 @@ func (hmm *MultiHMM) GenStatesMulti() {
 	row := make([]float64, hmm.NState)
 
 	// Set the initial state
-	check := make(map[int]bool)
 	for p := 0; p < hmm.NParticle; p++ {
-		for {
-			st := genDiscrete(hmm.Init)
-			if !check[st] {
-				hmm.State[p][0] = st
-				check[st] = true
-				break
-			}
-		}
+		hmm.State[p][0] = genDiscrete(hmm.Init)
 	}
 
 	// Set the rest of the states
 	for t := 1; t < ntime; t++ {
-		check = make(map[int]bool)
-		for p := 0; p < hmm.NParticle; p++ {
-			st0 := hmm.State[p][t-1]
-			copy(row, hmm.Trans[st0*hmm.NState:(st0+1)*hmm.NState])
-			for {
-				st := genDiscrete(row)
-				if !check[st] {
+
+		for g := range hmm.Group {
+
+			// Try to avoid collisions within a group at the same time
+			check := make(map[int]bool)
+
+			for _, p := range hmm.Group[g] {
+
+				st0 := hmm.State[p][t-1]
+				copy(row, hmm.Trans[st0*hmm.NState:(st0+1)*hmm.NState])
+
+				for k := 0; ; k++ {
+					st := genDiscrete(row)
+
+					// Try 100 times to avoid a collision
+					if k < 100 && check[st] {
+						continue
+					}
+
 					hmm.State[p][t] = st
 					check[st] = true
 					break
@@ -143,19 +138,23 @@ func (hmm *MultiHMM) GenStatesMulti() {
 
 // getCaps finds the lowest set of caps that provide at least nkp
 // state combinations.
-func (hmm *MultiHMM) getCaps(scores [][]float64, nkp int) []int {
+func (hmm *MultiHMM) getCaps(scores [][]float64, mask []bool, nkp int) []int {
 
 	// Initial caps
-	caps := make([]int, hmm.NParticle)
+	caps := make([]int, len(scores))
 	for j := range caps {
-		caps[j] = 1
+		if !mask[j] {
+			caps[j] = 1
+		}
 	}
 
 	// size returns the number of state combinations that fall below the cap.
 	size := func(caps []int) int {
 		s := 1
 		for j := range caps {
-			s *= caps[j]
+			if !mask[j] {
+				s *= caps[j]
+			}
 		}
 		return s
 	}
@@ -165,8 +164,10 @@ func (hmm *MultiHMM) getCaps(scores [][]float64, nkp int) []int {
 		lj := 0   // Position of cap to raise
 		first := true
 		for p := range caps {
+			if mask[p] {
+				continue
+			}
 			if caps[p] < hmm.NState {
-
 				// Should this be relative or absolute?
 				z := scores[p][caps[p]] - scores[p][0]
 				if first || z < lm {
@@ -189,17 +190,43 @@ func (hmm *MultiHMM) getCaps(scores [][]float64, nkp int) []int {
 
 // getValid constructs an array of valid multistates in ascending score order for
 // time point t.  On exit, obspr will hold the negative observation probabilities.
-func (hmm *MultiHMM) getValid(t int, obspr [][]float64, inds [][]int, mask []bool) []combiRec {
+func (hmm *MultiHMM) getValid(t int, obsgrp []int, obspr [][]float64, inds [][]int, mask []bool, nkp int) []combiRec {
+
+	// obspr, inds, and mask are set here
+	hmm.getMultiObsProb(t, obsgrp, obspr, inds, mask)
+
+	// Get the number of unmasked particles
+	ump := 0
+	for i := range mask {
+		if !mask[i] {
+			ump++
+		}
+	}
+
+	// Everything in the group is masked
+	if ump == 0 {
+		return nil
+	}
+
+	// Get the maximum number of states.  In some cases it may be impossible
+	// to find nkp multistates, so adjust accordingly.
+	if math.Log(float64(nkp)) > float64(ump)*math.Log(float64(hmm.NState)) {
+		nkp = int(math.Pow(float64(hmm.NState), float64(ump)))
+	}
+
+	nparticle := len(obsgrp)
+
+	// Workspace for constraint function.
+	wk := make([]int, nparticle)
 
 	// Make a constraint function that returns true if no two particles
 	// are in the same state.
 	constraint := func(ix []int, mask []bool) float64 {
 
-		wk := hmm.cwk
 		wk = wk[0:0]
-		for p, j := range ix {
-			if !mask[p] {
-				wk = append(wk, inds[p][j])
+		for pj, sj := range ix {
+			if !mask[pj] {
+				wk = append(wk, inds[pj][sj])
 			}
 		}
 		sort.IntSlice(wk).Sort()
@@ -216,40 +243,13 @@ func (hmm *MultiHMM) getValid(t int, obspr [][]float64, inds [][]int, mask []boo
 
 	// Gradually raise the caps until we get enough points.
 	var ipa []combiRec
-	f := 1
-	for {
-		hmm.getMultiObsProb(t, obspr, inds, mask)
-
-		// If all the particles are masked, there are no states to return
-		ms := 0
-		for j := range mask {
-			if !mask[j] {
-				ms++
-			}
-		}
-		if ms == 0 {
-			return nil
-		}
-
-		combi := &combinator{
-			scores:     obspr,
-			constraint: constraint,
-			hash:       fnv.New64(),
-			mask:       mask,
-		}
-
-		caps := hmm.getCaps(obspr, f*nkp)
+	for f := 1; f*nkp < 2000; f *= 2 {
+		combi := NewCombinator(obspr, constraint, mask)
+		caps := hmm.getCaps(obspr, mask, f*nkp)
 		ipa = combi.enumerate(caps)
 
 		if len(ipa) >= nkp {
 			break
-		}
-
-		// If we didn't get enough valid states, try again by retreiving more states.
-		f *= 2
-		if f > 10000 {
-			fmt.Printf("having trouble finding states that satisfy the constraint...\n")
-			fmt.Printf("t=%d, len(ipa)=%d, nkp=%d\n", t, len(ipa), nkp)
 		}
 	}
 
@@ -278,7 +278,7 @@ func (hmm *MultiHMM) recodeToStates(ipa []combiRec, inds [][]int) {
 func (hmm *MultiHMM) multiTrans(states1, states2 []int, mask []bool) float64 {
 
 	fpr := 0.0
-	for j := 0; j < hmm.NParticle; j++ {
+	for j := range mask {
 		if !mask[j] {
 			st1, st2 := states1[j], states2[j]
 			fpr += math.Log(hmm.Trans[st1*hmm.NState+st2])
@@ -288,23 +288,57 @@ func (hmm *MultiHMM) multiTrans(states1, states2 []int, mask []bool) float64 {
 	return fpr
 }
 
+// workspace for multi-state reconstruction
+type rws struct {
+	fpr []float64
+	lpx [][]int
+	tbp []int
+	npt []int
+}
+
+func newRws(ntime, nkp int) *rws {
+	return &rws{
+		fpr: make([]float64, ntime*nkp),
+		lpx: make([][]int, ntime*nkp),
+		tbp: make([]int, ntime*nkp),
+		npt: make([]int, ntime*nkp),
+	}
+}
+
 // ReonstructMulti uses a modified Viterbi algorithm to predict
 // the latent state sequence in a way that satistifes the constraints.
-func (hmm *MultiHMM) ReconstructMulti() {
+func (hmm *MultiHMM) ReconstructMulti(nkp int) {
 
-	hmm.PState = makeIntArray(hmm.NParticle, hmm.NTime)
+	fmt.Printf("\nJointly predicting state sequences...\n")
+	bar := progressbar.New(len(hmm.Group))
 
-	hmm.multiprob()
-	hmm.traceback()
+	var wg sync.WaitGroup
+
+	for _, obsgrp := range hmm.Group {
+
+		wg.Add(1)
+		go func(obsgrp []int) {
+			ws := newRws(hmm.NTime, nkp)
+			hmm.multiprob(obsgrp, nkp, ws)
+			hmm.traceback(obsgrp, nkp, ws)
+			_ = bar.Add(1)
+			wg.Done()
+		}(obsgrp)
+	}
+
+	wg.Wait()
+
+	fmt.Printf("\n") // returns the prompt in the usual place
 }
 
 // traceback is the Viterbi traceback
-func (hmm *MultiHMM) traceback() {
+func (hmm *MultiHMM) traceback(obsgrp []int, nkp int, ws *rws) {
 
-	fpr := hmm.fpr
-	tbp := hmm.tbp
-	lpx := hmm.lpx
-	npt := hmm.npt
+	fpr := ws.fpr
+	lpx := ws.lpx
+	tbp := ws.tbp
+	npt := ws.npt
+
 	pstate := hmm.PState
 	multistate := make([]int, hmm.NTime)
 
@@ -349,20 +383,20 @@ func (hmm *MultiHMM) traceback() {
 		}
 	}
 
-	// Fill in PState
+	// Fill in PState with the actual state labels
 	jt = 0
 	for t := 0; t < hmm.NTime; t++ {
 		if multistate[t] != NullState {
 			ix := lpx[jt+multistate[t]]
-			for p := 0; p < hmm.NParticle; p++ {
+			for j, p := range obsgrp {
 				if hmm.Obs[p][t*hmm.NState] == NullObs {
 					pstate[p][t] = NullState
 				} else {
-					pstate[p][t] = ix[p]
+					pstate[p][t] = ix[j]
 				}
 			}
 		} else {
-			for p := 0; p < hmm.NParticle; p++ {
+			for _, p := range obsgrp {
 				pstate[p][t] = NullState
 			}
 		}
@@ -372,19 +406,17 @@ func (hmm *MultiHMM) traceback() {
 
 // multiprob calculates the forward chain probabilities used by the
 // Viterbi traceback.
-func (hmm *MultiHMM) multiprob() {
+func (hmm *MultiHMM) multiprob(obsgrp []int, nkp int, ws *rws) {
 
-	print("Jointly predicting state sequences...\n")
-	bar := progressbar.New(hmm.NTime)
+	fpr := ws.fpr
+	lpx := ws.lpx
+	tbp := ws.tbp
+	npt := ws.npt
 
-	fpr := hmm.fpr
-	lpx := hmm.lpx
-	tbp := hmm.tbp
-	npt := hmm.npt
-
-	mask := make([]bool, hmm.NParticle)
-	obspr := makeFloatArray(hmm.NParticle, hmm.NState)
-	inds := makeIntArray(hmm.NParticle, hmm.NState)
+	nparticle := len(obsgrp)
+	mask := make([]bool, nparticle)
+	obspr := makeFloatArray(nparticle, hmm.NState)
+	inds := makeIntArray(nparticle, hmm.NState)
 
 	// Calculate forward probabilities
 	j0 := -2 * nkp
@@ -394,9 +426,7 @@ func (hmm *MultiHMM) multiprob() {
 		j0 += nkp
 		jt += nkp
 
-		bar.Add(1)
-
-		ipa := hmm.getValid(t, obspr, inds, mask)
+		ipa := hmm.getValid(t, obsgrp, obspr, inds, mask, nkp)
 		npt[t] = len(ipa)
 
 		if npt[t] == 0 {
@@ -409,9 +439,9 @@ func (hmm *MultiHMM) multiprob() {
 			for jj, cr := range ipa {
 
 				lpg := 0.0
-				for p, st := range cr.ix {
-					if !mask[p] {
-						lpg += -math.Log(hmm.Init[st]) - hmm.GetLogObsProb(p, t, st)
+				for pj, st := range cr.ix {
+					if !mask[pj] {
+						lpg += -math.Log(hmm.Init[st]) - hmm.GetLogObsProb(obsgrp[pj], t, st)
 					}
 				}
 
@@ -435,10 +465,10 @@ func (hmm *MultiHMM) multiprob() {
 			}
 
 			ltu := 0.0
-			for p, st := range cr.ix {
+			for pj, st := range cr.ix {
 				// Can't use obspr here because it has been sorted
-				if !mask[p] {
-					ltu -= hmm.GetLogObsProb(p, t, st)
+				if !mask[pj] {
+					ltu -= hmm.GetLogObsProb(obsgrp[pj], t, st)
 				}
 			}
 

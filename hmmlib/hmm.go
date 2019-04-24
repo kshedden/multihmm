@@ -1,10 +1,15 @@
 package hmmlib
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/gob"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/rand"
+	"os"
 	"sync"
 
 	"github.com/schollz/progressbar"
@@ -14,6 +19,9 @@ import (
 const (
 	// Maximum allowed value for Zprob
 	zpmax float64 = 0.95
+
+	// The Poisson/Tweedie mean parameters are never allowed to go below this value
+	minPoissonMean = 1e-2
 
 	// Minimum allowed value for the observation SD
 	sdmin = 1e-8
@@ -27,11 +35,11 @@ const (
 	NullState int = -9999
 )
 
-// VarType indicates how the variance structure is modeled.
-type VarType uint8
+// VarModelType indicates how the variance structure is modeled.
+type VarModelType uint8
 
 const (
-	VarFree VarType = iota
+	VarFree VarModelType = iota
 	VarConst
 )
 
@@ -57,7 +65,7 @@ type HMM struct {
 	NState int
 
 	// The type of variance constraint
-	VarForm VarType
+	VarForm VarModelType
 
 	// The observation distribution
 	ObsModelForm ObsModelType
@@ -82,7 +90,7 @@ type HMM struct {
 	// The log probability of observing zero, only used if ZeroInflated=true.
 	Zprob []float64
 
-	// The states
+	// The true states (if known)
 	State [][]int
 
 	// The observations
@@ -98,31 +106,70 @@ type HMM struct {
 	PState [][]int
 
 	// The overall log-likelihood
-	LLF float64
+	LLF []float64
 
 	// The log-likelihood function for one particle
 	llf []float64
 
-	// Additional parameters for the observation model
-	Aux []float64
+	// The Tweedie variance is mean^VarPower
+	VarPower float64
+
+	// Write log messages here
+	msglogger *log.Logger
+	parlogger *log.Logger
 }
 
 // New returns an HMM value with the given size parameters.
 func New(NParticle, NState, NTime int) *HMM {
 
-	return &HMM{
+	hmm := &HMM{
 		NParticle: NParticle,
 		NTime:     NTime,
 		NState:    NState,
 	}
+
+	return hmm
+}
+
+// SetLog provides a logger that will be used to write logging messages.
+func (hmm *HMM) SetLogger(logname string) *log.Logger {
+
+	fid, err := os.Create(logname + "_msg.log")
+	if err != nil {
+		panic(err)
+	}
+	hmm.msglogger = log.New(fid, "", log.Ltime)
+
+	fid, err = os.Create(logname + "_par.log")
+	if err != nil {
+		panic(err)
+	}
+	hmm.parlogger = log.New(fid, "", 0)
+
+	// The calling program can also use this logger
+	return hmm.msglogger
 }
 
 // Initialize allocates workspaces for parameter estimation.  Call
 // this prior to calling Fit.
 func (hmm *HMM) Initialize() {
+
+	if hmm.ZeroInflated && hmm.ObsModelForm != Gaussian {
+		fmt.Printf("When ZeroInflated is true, ObsModelForm must be Gaussian")
+		panic("")
+	}
+
 	hmm.Bprob = makeFloatArray(hmm.NParticle, hmm.NState*hmm.NTime)
 	hmm.Fprob = makeFloatArray(hmm.NParticle, hmm.NState*hmm.NTime)
 	hmm.llf = make([]float64, hmm.NParticle)
+
+	if hmm.msglogger == nil {
+		hmm.msglogger = log.New(os.Stderr, "", log.Ltime)
+	}
+
+	hmm.msglogger.Printf("%d particles\n", hmm.NParticle)
+	hmm.msglogger.Printf("%d time points per particle\n", hmm.NTime)
+	hmm.msglogger.Printf("%d states\n", hmm.NState)
 }
 
 // ReconstructStates uses the Viterbi algorithm to predict
@@ -167,7 +214,7 @@ func (hmm *HMM) reconstructionProbs(p int, lpr []float64, lpt []int) {
 		}
 
 		// Beginning from initial conditions
-		if t == 0 || (obs[j1] != NullObs && obs[j0] == NullObs) {
+		if t == 0 || obs[j0] == NullObs {
 			for st := 0; st < hmm.NState; st++ {
 				lpr[j1+st] = hmm.GetLogObsProb(p, t, st) + math.Log(hmm.Init[st])
 			}
@@ -233,12 +280,13 @@ func (hmm *HMM) SetStartParams() {
 
 	if hmm.ObsModelForm == Gaussian {
 		hmm.Std = make([]float64, hmm.NState*hmm.NState)
+		sdmn := floats.Sum(std) / float64(len(std))
 		for i := 0; i < hmm.NState; i++ {
 			for j := 0; j < hmm.NState; j++ {
-				if i == j {
-					hmm.Std[i*hmm.NState+j] = std[i]
+				if hmm.VarForm == VarConst {
+					hmm.Std[i*hmm.NState+j] = sdmn
 				} else {
-					hmm.Std[i*hmm.NState+j] = std[i] / 5
+					hmm.Std[i*hmm.NState+j] = std[i]
 				}
 			}
 		}
@@ -251,7 +299,7 @@ func (hmm *HMM) SetStartParams() {
 				if i == j {
 					hmm.Zprob[i*hmm.NState+j] = 0.1
 				} else {
-					hmm.Zprob[i*hmm.NState+j] = 0.7
+					hmm.Zprob[i*hmm.NState+j] = 0.5
 				}
 			}
 		}
@@ -298,17 +346,19 @@ func (hmm *HMM) getTweedieLogObsProb(p, t, st int) float64 {
 	obs := hmm.Obs[p]
 
 	if obs[t*hmm.NState] == NullObs {
-		return math.Inf(-1)
+		panic("should not reach here")
 	}
 
-	pw := hmm.Aux[0]
+	pw := hmm.VarPower
 
 	var lpr float64
-
 	ii := st * hmm.NState
 	for st1 := 0; st1 < hmm.NState; st1++ {
 		y := obs[t*hmm.NState+st1]
 		mn := hmm.Mean[ii]
+		if mn < minPoissonMean {
+			mn = minPoissonMean
+		}
 		lmn := math.Log(mn)
 		lpr += y*math.Exp((1-pw)*lmn)/(1-pw) - math.Exp((2-pw)*lmn)/(2-pw)
 		ii++
@@ -322,7 +372,7 @@ func (hmm *HMM) getPoissonLogObsProb(p, t, st int) float64 {
 	obs := hmm.Obs[p]
 
 	if obs[t*hmm.NState] == NullObs {
-		return math.Inf(-1)
+		panic("should not reach here")
 	}
 
 	var lpr float64
@@ -330,6 +380,9 @@ func (hmm *HMM) getPoissonLogObsProb(p, t, st int) float64 {
 	for st1 := 0; st1 < hmm.NState; st1++ {
 		y := obs[t*hmm.NState+st1]
 		mn := hmm.Mean[ii]
+		if mn < minPoissonMean {
+			mn = minPoissonMean
+		}
 		lpr += -mn + y*math.Log(mn)
 		ii++
 	}
@@ -342,22 +395,27 @@ func (hmm *HMM) getGaussianLogObsProb(p, t, st int) float64 {
 	obs := hmm.Obs[p]
 
 	if obs[t*hmm.NState] == NullObs {
-		return math.Inf(-1)
+		panic("should not reach here")
 	}
 
 	var lpr float64
 	ii := st * hmm.NState
 	for st1 := 0; st1 < hmm.NState; st1++ {
 		y := obs[t*hmm.NState+st1]
-		zpr := hmm.Zprob[ii]
 		mn := hmm.Mean[ii]
 		sd := hmm.Std[ii]
-		if y == 0 {
-			lpr += math.Log(zpr)
+		if hmm.ZeroInflated {
+			zpr := hmm.Zprob[ii]
+			if y == 0 {
+				lpr += math.Log(zpr)
+			} else {
+				z := (y - mn) / sd
+				q := -math.Log(sd) - z*z/2
+				lpr += q + math.Log(1.0-zpr)
+			}
 		} else {
 			z := (y - mn) / sd
-			q := -math.Log(sd) - z*z/2
-			lpr += q + math.Log(1.0-zpr)
+			lpr += -math.Log(sd) - z*z/2
 		}
 		ii++
 	}
@@ -365,7 +423,8 @@ func (hmm *HMM) getGaussianLogObsProb(p, t, st int) float64 {
 	return lpr
 }
 
-// GenStates generates a random state sequence.
+// GenStates generates a random state sequence.  See GenStatesMulti for a version
+// of this function that avoids collisions.
 func (hmm *HMM) GenStates() {
 
 	hmm.State = makeIntArray(1, hmm.NTime)
@@ -405,15 +464,18 @@ func (hmm *HMM) GenObs() {
 				for j := 0; j < hmm.NState; j++ {
 					switch hmm.ObsModelForm {
 					case Gaussian:
-						u := rand.NormFloat64()
-						hmm.Obs[p][t*hmm.NState+j] = hmm.Mean[ip+j] + u*hmm.Std[ip+j]
+						if hmm.ZeroInflated && rand.Float64() < hmm.Zprob[ip+j] {
+							hmm.Obs[p][t*hmm.NState+j] = 0
+						} else {
+							u := rand.NormFloat64()
+							hmm.Obs[p][t*hmm.NState+j] = hmm.Mean[ip+j] + u*hmm.Std[ip+j]
+						}
 					case Poisson:
 						hmm.Obs[p][t*hmm.NState+j] = genPoisson(hmm.Mean[ip+j])
 					case Tweedie:
-						// Use Poisson for now
-						hmm.Obs[p][t*hmm.NState+j] = genPoisson(hmm.Mean[ip+j])
+						hmm.Obs[p][t*hmm.NState+j] = genTweedie(hmm.Mean[ip+j], 1, hmm.VarPower)
 					default:
-						panic("unkown model\n")
+						panic("unknown model\n")
 					}
 				}
 			}
@@ -470,9 +532,9 @@ func (hmm *HMM) ForwardParticle(p int, wg *sync.WaitGroup) {
 		}
 
 		// Initial time point
-		if t == 0 || (obs[j0] == NullObs && obs[j1] != NullObs) {
+		if t == 0 || obs[j0] == NullObs {
 			for st := 0; st < hmm.NState; st++ {
-				fprob[st] = math.Log(hmm.Init[st]) + hmm.GetLogObsProb(p, t, st)
+				fprob[j1+st] = math.Log(hmm.Init[st]) + hmm.GetLogObsProb(p, t, st)
 			}
 			llf += normalizeMaxLog(fprob[j1 : j1+hmm.NState])
 			continue
@@ -484,7 +546,8 @@ func (hmm *HMM) ForwardParticle(p int, wg *sync.WaitGroup) {
 		}
 
 		// Calculate components of the update on the log scale.
-		// Transition is from From st2 at t-1 to st1 at t.
+		// Transition is from state st2 at time t-1 to state st1
+		// at time t.
 		for st1 := 0; st1 < hmm.NState; st1++ {
 			yp := hmm.GetLogObsProb(p, t, st1)
 			for st2 := 0; st2 < hmm.NState; st2++ {
@@ -492,7 +555,7 @@ func (hmm *HMM) ForwardParticle(p int, wg *sync.WaitGroup) {
 			}
 		}
 
-		// Does not change result due to scale invariance
+		// This shift does not change the result due to scale invariance
 		mx := floats.Max(terms)
 		llf += mx
 		floats.AddConst(-mx, terms)
@@ -511,7 +574,7 @@ func (hmm *HMM) ForwardParticle(p int, wg *sync.WaitGroup) {
 	hmm.llf[p] = llf
 }
 
-// BackwardParticle calculates the backward probabilites for one particle.
+// BackwardParticle calculates the backward probabilities for one particle.
 func (hmm *HMM) BackwardParticle(p int, wg *sync.WaitGroup) {
 
 	defer wg.Done()
@@ -543,7 +606,7 @@ func (hmm *HMM) BackwardParticle(p int, wg *sync.WaitGroup) {
 		}
 
 		// Initialize
-		if t == hmm.NTime-1 || (obs[j1] == NullObs && obs[j0] != NullObs) {
+		if t == hmm.NTime-1 || obs[j1] == NullObs {
 			for st := 0; st < hmm.NState; st++ {
 				bprob[j0+st] = 1
 			}
@@ -575,44 +638,66 @@ func (hmm *HMM) BackwardParticle(p int, wg *sync.WaitGroup) {
 	}
 }
 
+func (hmm *HMM) updateTransParticle(p int, newtrans, logtrans []float64, wg *sync.WaitGroup, mut *sync.Mutex) {
+
+	defer wg.Done()
+	obs := hmm.Obs[p]
+	fprob := hmm.Fprob[p]
+	bprob := hmm.Bprob[p]
+	joint := make([]float64, hmm.NState*hmm.NState)
+	jointsum := make([]float64, hmm.NState*hmm.NState)
+	lcp := make([]float64, hmm.NState)
+
+	for t := 0; t < hmm.NTime-1; t++ {
+
+		if obs[t*hmm.NState] == NullObs || obs[(t+1)*hmm.NState] == NullObs {
+			continue
+		}
+
+		for st := 0; st < hmm.NState; st++ {
+			lcp[st] = hmm.GetLogObsProb(p, t+1, st) + math.Log(bprob[t*hmm.NState+st])
+		}
+
+		// Get the joint probabilities on the log scale
+		for st1 := 0; st1 < hmm.NState; st1++ {
+			lfp := math.Log(fprob[t*hmm.NState+st1])
+			for st2 := 0; st2 < hmm.NState; st2++ {
+				joint[st1*hmm.NState+st2] = lfp + lcp[st2] + logtrans[st1*hmm.NState+st2]
+			}
+		}
+
+		// Convert to probabilities
+		floats.AddConst(-floats.Max(joint), joint)
+		for j := range joint {
+			joint[j] = math.Exp(joint[j])
+		}
+		normalizeSum(joint, 0)
+
+		floats.Add(jointsum, joint)
+	}
+
+	mut.Lock()
+	floats.Add(newtrans, jointsum)
+	mut.Unlock()
+}
+
 // UpdateTrans updates the transmission probability matrix.
 func (hmm *HMM) UpdateTrans() {
 
 	newtrans := make([]float64, hmm.NState*hmm.NState)
-	rtrans := make([]float64, hmm.NState*hmm.NState)
-	lcp := make([]float64, hmm.NState)
 
-	for p := 0; p < hmm.NParticle; p++ {
-		obs := hmm.Obs[p]
-		for t := 0; t < hmm.NTime-1; t++ {
-
-			if obs[t*hmm.NState] == NullObs || obs[(t+1)*hmm.NState] == NullObs {
-				continue
-			}
-
-			for st := 0; st < hmm.NState; st++ {
-				lcp[st] = hmm.GetLogObsProb(p, t+1, st)
-			}
-
-			for st1 := 0; st1 < hmm.NState; st1++ {
-				u := math.Log(hmm.Fprob[p][t*hmm.NState+st1])
-				for st2 := 0; st2 < hmm.NState; st2++ {
-					z := u + math.Log(hmm.Bprob[p][t*hmm.NState+st2])
-					z += math.Log(hmm.Trans[st1*hmm.NState+st2])
-					z += lcp[st2]
-					rtrans[st1*hmm.NState+st2] = z
-				}
-			}
-
-			floats.AddConst(-floats.Max(rtrans), rtrans)
-			for j := range rtrans {
-				rtrans[j] = math.Exp(rtrans[j])
-			}
-
-			normalizeSum(rtrans, 0)
-			floats.Add(newtrans, rtrans)
-		}
+	logtrans := make([]float64, hmm.NState*hmm.NState)
+	for j := range hmm.Trans {
+		logtrans[j] = math.Log(hmm.Trans[j])
 	}
+
+	var wg sync.WaitGroup
+	var mut sync.Mutex
+	for p := 0; p < hmm.NParticle; p++ {
+		wg.Add(1)
+		go hmm.updateTransParticle(p, newtrans, logtrans, &wg, &mut)
+	}
+	wg.Wait()
 
 	// Normalize to probabilties by row
 	for st := 0; st < hmm.NState; st++ {
@@ -622,7 +707,7 @@ func (hmm *HMM) UpdateTrans() {
 	hmm.Trans = newtrans
 }
 
-// OracleTrans estimates the transmission probabilites from a known sequence of
+// OracleTrans estimates the transmission probabilities from a known sequence of
 // state values.
 func (hmm *HMM) OracleTrans() []float64 {
 
@@ -689,7 +774,7 @@ func (hmm *HMM) OracleZprob() []float64 {
 func (hmm *HMM) MarginalMoments() ([]float64, []float64) {
 
 	mean := make([]float64, hmm.NState)
-	nn := make([]float64, hmm.NState)
+	num := make([]float64, hmm.NState)
 	for p := 0; p < hmm.NParticle; p++ {
 		i := 0
 		obs := hmm.Obs[p]
@@ -701,13 +786,13 @@ func (hmm *HMM) MarginalMoments() ([]float64, []float64) {
 			for st := 0; st < hmm.NState; st++ {
 				if obs[i] != 0 {
 					mean[st] += obs[i]
-					nn[st]++
+					num[st]++
 				}
 				i++
 			}
 		}
 	}
-	floats.Div(mean, nn)
+	floats.Div(mean, num)
 
 	std := make([]float64, hmm.NState)
 	for p := 0; p < hmm.NParticle; p++ {
@@ -728,15 +813,13 @@ func (hmm *HMM) MarginalMoments() ([]float64, []float64) {
 			}
 		}
 	}
-	floats.Div(std, nn)
+	floats.Div(std, num)
 
 	for i := range std {
-
 		if math.IsNaN(mean[i]) || math.IsNaN(std[i]) {
 			std[i] = 1
 			mean[i] = 0
 		}
-
 		std[i] = math.Sqrt(std[i])
 	}
 
@@ -762,9 +845,7 @@ func (hmm *HMM) OracleMoments() ([]float64, []float64) {
 				y := obs[t*hmm.NState+st2]
 				if !hmm.ZeroInflated || y != 0 {
 					mean[st1*hmm.NState+st2] += y
-					if hmm.ObsModelForm == Gaussian {
-						std[st1*hmm.NState+st2] += y * y
-					}
+					std[st1*hmm.NState+st2] += y * y
 					den[st1*hmm.NState+st2] += 1
 				}
 			}
@@ -775,76 +856,53 @@ func (hmm *HMM) OracleMoments() ([]float64, []float64) {
 		j := st1 * hmm.NState
 		for st2 := 0; st2 < hmm.NState; st2++ {
 			mean[j] /= den[j]
-			if hmm.ObsModelForm == Gaussian {
-				std[j] /= den[j]
-			}
+			std[j] /= den[j]
 			j += 1
 		}
 	}
 
-	if hmm.ObsModelForm == Gaussian {
-		for st1 := 0; st1 < hmm.NState; st1++ {
-			i := st1 * hmm.NState
-			for st2 := 0; st2 < hmm.NState; st2++ {
-				m := mean[i]
-				std[i] -= m * m
-				std[i] = math.Sqrt(std[i])
-				i += 1
-			}
+	for st1 := 0; st1 < hmm.NState; st1++ {
+		i := st1 * hmm.NState
+		for st2 := 0; st2 < hmm.NState; st2++ {
+			m := mean[i]
+			std[i] -= m * m
+			std[i] = math.Sqrt(std[i])
+			i += 1
 		}
 	}
 
 	return mean, std
 }
 
-func minmax(x []int) (int, int) {
-	mn, mx := x[0], x[0]
-	for j := 1; j < len(x); j++ {
-		if x[j] < mn {
-			mn = x[j]
-		}
-		if x[j] > mx {
-			mx = x[j]
-		}
-	}
-	return mn, mx
-}
+func (hmm *HMM) WriteOracleSummary(labels []string) {
 
-func (hmm *HMM) WriteOracleSummary(labels []string, w io.Writer) {
+	hmm.parlogger.Printf("\nOracle statistics:\n")
 
-	io.WriteString(w, "\nOracle statistics:\n")
-
-	io.WriteString(w, fmt.Sprintf("%d particles\n", hmm.NParticle))
-	io.WriteString(w, fmt.Sprintf("%d time points per particle\n", hmm.NTime))
-	io.WriteString(w, fmt.Sprintf("%d states\n", hmm.NState))
-
-	io.WriteString(w, "Initial state distribution:\n")
+	hmm.parlogger.Printf("Initial state distribution:\n")
 	ist := hmm.OracleInit()
-	writeMatrix(ist, 0, hmm.NState, 1, labels, w)
-	io.WriteString(w, "\n")
+	hmm.writeMatrix(ist, 0, hmm.NState, 1, labels)
+	hmm.parlogger.Printf("\n")
 
-	io.WriteString(w, "Transition matrix:\n")
+	hmm.parlogger.Printf("Transition matrix:\n")
 	tr := hmm.OracleTrans()
-	writeMatrix(tr, 0, hmm.NState, hmm.NState, labels, w)
-	io.WriteString(w, "\n")
+	hmm.writeMatrix(tr, 0, hmm.NState, hmm.NState, labels)
+	hmm.parlogger.Printf("\n")
 
 	if hmm.ZeroInflated {
-		io.WriteString(w, "Zero probabilities:\n")
+		hmm.parlogger.Printf("Zero probabilities:\n")
 		zpr := hmm.OracleZprob()
-		writeMatrix(zpr, 0, hmm.NState, hmm.NState, labels, w)
-		io.WriteString(w, "\n")
+		hmm.writeMatrix(zpr, 0, hmm.NState, hmm.NState, labels)
+		hmm.parlogger.Printf("\n")
 	}
 
-	io.WriteString(w, "Means:\n")
+	hmm.parlogger.Printf("Means:\n")
 	mean, sd := hmm.OracleMoments()
-	writeMatrix(mean, 0, hmm.NState, hmm.NState, labels, w)
-	io.WriteString(w, "\n")
+	hmm.writeMatrix(mean, 0, hmm.NState, hmm.NState, labels)
+	hmm.parlogger.Printf("\n")
 
-	if hmm.ObsModelForm == Gaussian {
-		io.WriteString(w, "Standard deviations:\n")
-		writeMatrix(sd, 0, hmm.NState, hmm.NState, labels, w)
-		io.WriteString(w, "\n")
-	}
+	hmm.parlogger.Printf("Standard deviations:\n")
+	hmm.writeMatrix(sd, 0, hmm.NState, hmm.NState, labels)
+	hmm.parlogger.Printf("\n")
 }
 
 // ObservedInit returns the frequency distribution of initial states.
@@ -853,8 +911,12 @@ func (hmm *HMM) OracleInit() []float64 {
 	v := make([]float64, hmm.NState)
 
 	for _, u := range hmm.State {
-		if u[0] != NullState {
-			v[u[0]]++
+		// Use first non-null value for each particle
+		for j := range u {
+			if u[j] != NullState {
+				v[u[j]]++
+				break
+			}
 		}
 	}
 
@@ -920,8 +982,12 @@ func (hmm *HMM) updateGaussianObsParams() {
 				for st1 := 0; st1 < hmm.NState; st1++ {
 					for st2 := 0; st2 < hmm.NState; st2++ {
 						y := obs[t*hmm.NState+st2]
-						if y == 0.0 {
-							hmm.Zprob[st1*hmm.NState+st2] += pr[st1]
+						if hmm.ZeroInflated {
+							if y == 0.0 {
+								hmm.Zprob[st1*hmm.NState+st2] += pr[st1]
+							} else {
+								hmm.Mean[st1*hmm.NState+st2] += pr[st1] * y
+							}
 						} else {
 							hmm.Mean[st1*hmm.NState+st2] += pr[st1] * y
 						}
@@ -937,22 +1003,26 @@ func (hmm *HMM) updateGaussianObsParams() {
 		i, j := st*hmm.NState, (st+1)*hmm.NState
 		var s = 1 / pt[st]
 		if pt[st] < 1e-10 {
-			print("Underflow in Std update")
+			hmm.msglogger.Printf("Underflow in Gaussian SD update")
 			s = 0
 		}
-		floats.Scale(s, hmm.Zprob[i:j])
+		if hmm.ZeroInflated {
+			floats.Scale(s, hmm.Zprob[i:j])
+		}
 		floats.Scale(s, hmm.Mean[i:j])
 	}
 
-	// Truncate the zero-probabilities
-	for i := range hmm.Zprob {
-		if hmm.Zprob[i] > zpmax {
-			hmm.Zprob[i] = zpmax
+	if hmm.ZeroInflated {
+		// Truncate the zero-probabilities
+		for i := range hmm.Zprob {
+			if hmm.Zprob[i] > zpmax {
+				hmm.Zprob[i] = zpmax
+			}
 		}
-	}
 
-	for i := 0; i < hmm.NState*hmm.NState; i++ {
-		hmm.Mean[i] /= (1.0 - hmm.Zprob[i])
+		for i := 0; i < hmm.NState*hmm.NState; i++ {
+			hmm.Mean[i] /= (1.0 - hmm.Zprob[i])
+		}
 	}
 }
 
@@ -964,24 +1034,25 @@ func (hmm *HMM) updatePoissonObsParams() {
 	zero(hmm.Mean)
 
 	for p := 0; p < hmm.NParticle; p++ {
-		i := 0
+		i := -hmm.NState
 		obs := hmm.Obs[p]
 		for t := 0; t < hmm.NTime; t++ {
+
+			i += hmm.NState
+
+			if obs[i] == NullObs {
+				continue
+			}
 
 			floats.MulTo(pr, hmm.Fprob[p][i:i+hmm.NState], hmm.Bprob[p][i:i+hmm.NState])
 			normalizeSum(pr, 0)
 			floats.Add(pt, pr)
-
-			if obs[t*hmm.NState] != NullObs {
-				for st1 := 0; st1 < hmm.NState; st1++ {
-					for st2 := 0; st2 < hmm.NState; st2++ {
-						y := obs[t*hmm.NState+st2]
-						hmm.Mean[st1*hmm.NState+st2] += pr[st1] * y
-					}
+			for st1 := 0; st1 < hmm.NState; st1++ {
+				for st2 := 0; st2 < hmm.NState; st2++ {
+					y := obs[t*hmm.NState+st2]
+					hmm.Mean[st1*hmm.NState+st2] += pr[st1] * y
 				}
 			}
-
-			i += hmm.NState
 		}
 	}
 
@@ -989,7 +1060,7 @@ func (hmm *HMM) updatePoissonObsParams() {
 		i, j := st*hmm.NState, (st+1)*hmm.NState
 		var s = 1 / pt[st]
 		if pt[st] < 1e-10 {
-			print("Underflow in Poisson update...")
+			hmm.msglogger.Printf("Underflow in Poisson update...")
 			s = 0
 		}
 		floats.Scale(s, hmm.Mean[i:j])
@@ -1039,7 +1110,11 @@ func (hmm *HMM) UpdateStdFree() {
 	}
 
 	for i := 0; i < hmm.NState*hmm.NState; i++ {
-		hmm.Std[i] = math.Sqrt(hmm.Std[i] / (1.0 - hmm.Zprob[i]))
+		if hmm.ZeroInflated {
+			hmm.Std[i] = math.Sqrt(hmm.Std[i] / (1.0 - hmm.Zprob[i]))
+		} else {
+			hmm.Std[i] = math.Sqrt(hmm.Std[i])
+		}
 		if hmm.Std[i] < sdmin {
 			hmm.Std[i] = sdmin
 		}
@@ -1081,14 +1156,24 @@ func (hmm *HMM) UpdateStdConst() {
 
 	floats.Scale(1/float64(pt), hmm.Std[0:hmm.NState])
 
-	for i := 0; i < hmm.NState*hmm.NState; i++ {
-		hmm.Std[i] = math.Sqrt(hmm.Std[i] / (1.0 - hmm.Zprob[i]))
+	if hmm.ZeroInflated {
+		for i := range hmm.Std {
+			hmm.Std[i] = math.Sqrt(hmm.Std[i] / (1.0 - hmm.Zprob[i]))
+		}
+	} else {
+		for i := range hmm.Std {
+			hmm.Std[i] = math.Sqrt(hmm.Std[i])
+		}
+	}
+
+	// Cap the SD parameters
+	for i := range hmm.Std {
 		if hmm.Std[i] < sdmin {
 			hmm.Std[i] = sdmin
 		}
 	}
 
-	// The remaining roles are constrained to be equal to the first row.
+	// The remaining rows are constrained to be equal to the first row.
 	for i := 1; i < hmm.NState; i++ {
 		j := i * hmm.NState
 		copy(hmm.Std[j:j+hmm.NState], hmm.Std[0:hmm.NState])
@@ -1096,20 +1181,30 @@ func (hmm *HMM) UpdateStdConst() {
 }
 
 // Fit uses the EM algorithm to estimate the structural parameters of the HMM.
-func (hmm *HMM) Fit(iter int) {
+func (hmm *HMM) Fit(maxiter int) {
 
-	print("Estimating model parameters...\n")
-	bar := progressbar.New(iter)
+	hmm.LLF = make([]float64, 0, maxiter)
+
+	hmm.msglogger.Printf("Estimating model parameters...\n")
+	bar := progressbar.New(4 * maxiter)
 	var llf float64
 
-	for i := 0; i < iter; i++ {
-		bar.Add(1)
+	for i := 0; i < maxiter; i++ {
+		_ = bar.Add(1)
+		hmm.msglogger.Printf("Beginning ForwardBackward...")
 		hmm.ForwardBackward()
+		_ = bar.Add(1)
+		hmm.msglogger.Printf("Beginning UpdateTrans...")
 		hmm.UpdateTrans()
+		_ = bar.Add(1)
+		hmm.msglogger.Printf("Beginning UpdateInit...")
 		hmm.UpdateInit()
+		_ = bar.Add(1)
+		hmm.msglogger.Printf("Beginning UpdateObsParams...")
 		hmm.UpdateObsParams()
 
 		if hmm.ObsModelForm == Gaussian {
+			hmm.msglogger.Printf("Updating variance parameters...")
 			switch hmm.VarForm {
 			case VarFree:
 				hmm.UpdateStdFree()
@@ -1123,7 +1218,7 @@ func (hmm *HMM) Fit(iter int) {
 		llfnew := floats.Sum(hmm.llf)
 		if i > 0 {
 			if llfnew < llf {
-				print("Log-likelihood decreased\n")
+				hmm.msglogger.Printf("Log-likelihood increased by %f\n", llf-llfnew)
 			} else if llfnew-llf < 1e-8 {
 				// converged
 				break
@@ -1131,54 +1226,61 @@ func (hmm *HMM) Fit(iter int) {
 		}
 
 		llf = llfnew
+		hmm.msglogger.Printf("llf=%f\n", llf)
 	}
 
-	hmm.LLF = llf
+	hmm.LLF = append(hmm.LLF, llf)
 }
 
 // WriteSummary writes the model parameters to the given writer.
 // The optional row labels are used if provided.
-func (hmm *HMM) WriteSummary(labels []string, title string, w io.Writer) {
+func (hmm *HMM) WriteSummary(labels []string, title string) {
 
-	io.WriteString(w, title)
-	io.WriteString(w, "\n\n")
+	hmm.parlogger.Printf(title)
+	hmm.parlogger.Printf("\n")
 
-	io.WriteString(w, "Initial states distribution:\n")
-	writeMatrix(hmm.Init, 0, hmm.NState, 1, labels, w)
-	io.WriteString(w, "\n")
+	hmm.parlogger.Printf("Initial states distribution:\n")
+	hmm.writeMatrix(hmm.Init, 0, hmm.NState, 1, labels)
+	hmm.parlogger.Printf("\n")
 
-	io.WriteString(w, "Transition matrix:\n")
-	writeMatrix(hmm.Trans, 0, hmm.NState, hmm.NState, labels, w)
-	io.WriteString(w, "\n")
+	hmm.parlogger.Printf("Transition matrix:\n")
+	hmm.writeMatrix(hmm.Trans, 0, hmm.NState, hmm.NState, labels)
+	hmm.parlogger.Printf("\n")
 
 	if hmm.ZeroInflated {
-		io.WriteString(w, "Zero probabilties:\n")
-		writeMatrix(hmm.Zprob, 0, hmm.NState, hmm.NState, labels, w)
-		io.WriteString(w, "\n")
+		hmm.parlogger.Printf("Zero probabilties:\n")
+		hmm.writeMatrix(hmm.Zprob, 0, hmm.NState, hmm.NState, labels)
+		hmm.parlogger.Printf("\n")
 	}
 
-	io.WriteString(w, "Means:\n")
-	writeMatrix(hmm.Mean, 0, hmm.NState, hmm.NState, labels, w)
-	io.WriteString(w, "\n")
+	hmm.parlogger.Printf("Means:\n")
+	hmm.writeMatrix(hmm.Mean, 0, hmm.NState, hmm.NState, labels)
+	hmm.parlogger.Printf("\n")
 
 	if hmm.ObsModelForm == Gaussian {
-		io.WriteString(w, "Standard deviations:\n")
-		writeMatrix(hmm.Std, 0, hmm.NState, hmm.NState, labels, w)
-		io.WriteString(w, "\n")
+		hmm.parlogger.Printf("Standard deviations:\n")
+		hmm.writeMatrix(hmm.Std, 0, hmm.NState, hmm.NState, labels)
+		hmm.parlogger.Printf("\n")
 	}
 }
 
-// writeMatrix writes a matrix in text format to the given writer
-func writeMatrix(x []float64, off, nrow, ncol int, labels []string, w io.Writer) {
+// writeMatrix writes a matrix in text format to the logger
+func (hmm *HMM) writeMatrix(x []float64, off, nrow, ncol int, labels []string) {
+
+	var buf bytes.Buffer
 
 	for i := 0; i < nrow; i++ {
+
+		buf.Reset()
+
 		if labels != nil {
-			io.WriteString(w, fmt.Sprintf("%-20s", labels[i]))
+			_, _ = io.WriteString(&buf, fmt.Sprintf("%-20s", labels[i]))
 		}
 		for j := 0; j < ncol; j++ {
-			io.WriteString(w, fmt.Sprintf("%12.4f ", x[off+i*ncol+j]))
+			_, _ = io.WriteString(&buf, fmt.Sprintf("%12.4f ", x[off+i*ncol+j]))
 		}
-		io.WriteString(w, "\n")
+
+		hmm.parlogger.Printf(buf.String())
 	}
 }
 
@@ -1285,33 +1387,6 @@ func makeFloatArray(r, c int) [][]float64 {
 	return x
 }
 
-func xxxgenPoisson(lambda float64) float64 {
-
-	c := 0.767 - 3.36/lambda
-	beta := math.Pi / math.Sqrt(3.0*lambda)
-	alpha := beta * lambda
-	k := math.Log(c) - lambda - math.Log(beta)
-
-	for {
-		u := rand.Float64()
-		x := (alpha - math.Log((1.0-u)/u)) / beta
-		n := math.Floor(x + 0.5)
-		if n < 0 {
-			continue
-		}
-		v := rand.Float64()
-		y := alpha - beta*x
-		z := 1.0 + math.Exp(y)
-		lhs := y + math.Log(v/(z*z))
-		rhs := k + n*math.Log(lambda)
-		lg, _ := math.Lgamma(n + 1)
-		rhs -= lg
-		if lhs <= rhs {
-			return n
-		}
-	}
-}
-
 func genPoisson(lambda float64) float64 {
 
 	if lambda <= 0 {
@@ -1328,4 +1403,98 @@ func genPoisson(lambda float64) float64 {
 	}
 
 	return float64(k - 1)
+}
+
+// Generate a Gamma random variable with mean alp*bet and variance alp*bet^2.
+func genGamma(alp, bet float64) float64 {
+
+	d := alp - 1/3.
+	c := 1 / math.Sqrt(9*d)
+
+	for {
+		z := rand.NormFloat64()
+		u := rand.Float64()
+		v := math.Pow(1+c*z, 3)
+		if z > -1/c && math.Log(u) < z*z/2+d-d*v+d*math.Log(v) {
+			return bet * d * v
+		}
+	}
+}
+
+// Generate a Tweedie random variable with mean mu and variance sig2 * mu^p.
+func genTweedie(mu, sig2, p float64) float64 {
+
+	if p <= 1 || p >= 2 {
+		panic("p must be between 1 and 2")
+	}
+
+	lam := math.Pow(mu, 2-p) / ((2 - p) * sig2)
+	alp := (2 - p) / (p - 1)
+	bet := math.Pow(mu, 1-p) / ((p - 1) * sig2)
+
+	n := genPoisson(lam)
+
+	var z float64
+	for k := 0; k < int(n); k++ {
+		z += genGamma(alp, 1/bet)
+	}
+
+	return z
+}
+
+// ReadHMM reads a compressed MultiHMM value from a gzip-compressed
+// gob file.
+func ReadHMM(fname string) *MultiHMM {
+
+	fid, err := os.Open(fname)
+	if err != nil {
+		panic(err)
+	}
+	defer fid.Close()
+
+	gid, err := gzip.NewReader(fid)
+	if err != nil {
+		panic(err)
+	}
+	defer gid.Close()
+
+	dec := gob.NewDecoder(gid)
+
+	var hmm MultiHMM
+	if err := dec.Decode(&hmm); err != nil {
+		panic(err)
+	}
+
+	return &hmm
+}
+
+// CompareStates returns the number of positions where the state
+// sequences x and y agree, and the number of positions in which
+// x and y are not null.  Panics if the lengths of x and y differ,
+// or if there is any position in which exactly one of x and y is
+// null.
+func CompareStates(x, y []int) (int, int) {
+
+	if len(x) != len(y) {
+		panic("Lengths are not equal")
+	}
+
+	var e, n int
+	for t := range x {
+		if x[t] == NullState && y[t] != NullState {
+			panic("inconsistent")
+		}
+		if x[t] != NullState && y[t] == NullState {
+			panic("inconsistent")
+		}
+		if x[t] == NullState {
+			continue
+		}
+		if x[t] != y[t] {
+			e++
+		}
+		n++
+	}
+
+	return e, n
 }
