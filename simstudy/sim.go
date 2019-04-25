@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/kshedden/multihmm/hmmlib"
@@ -99,16 +102,51 @@ func fit(g *model) {
 	}
 }
 
+func collect() {
+
+	fid, err := os.Open("hmm_msg.log")
+	if err != nil {
+		panic(err)
+	}
+	defer fid.Close()
+
+	scanner := bufio.NewScanner(fid)
+
+	ec := regexp.MustCompile(`(\d*)/(\d*) total errors`)
+
+	for scanner.Scan() {
+
+		line := scanner.Text()
+
+		ma := ec.FindAllSubmatch([]byte(line), -1)
+		if len(ma) == 0 {
+			continue
+		}
+		numer, err := strconv.Atoi(string(ma[0][1]))
+		if err != nil {
+			panic(err)
+		}
+
+		denom, err := strconv.Atoi(string(ma[0][2]))
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Printf("numer=%d, denom=%d\n", numer, denom)
+	}
+}
+
 func run(m *model) {
 
-	m.obsmodel = hmmlib.Tweedie
+	m.obsmodel = hmmlib.Poisson
 	m.zeroinflated = false
 	m.varpower = 1.5
 
-	m.nkp = 200
-	for i := 0; i < 1; i++ {
+	m.nkp = 10
+	for i := 0; i < 2; i++ {
 		generate(m)
 		fit(m)
+		collect()
 		m.nkp += 20
 	}
 }

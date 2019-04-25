@@ -68,10 +68,15 @@ func (hmm *MultiHMM) getMultiObsProb(t int, obsgrp []int, obspr [][]float64, ind
 			continue
 		}
 
+		// Calculate the marginal posterior probability for the particle
+		// being at each possible state, at a given time, given all of the
+		// data.
 		fprob := hmm.Fprob[p][t*hmm.NState : (t+1)*hmm.NState]
 		bprob := hmm.Bprob[p][t*hmm.NState : (t+1)*hmm.NState]
 		floats.MulTo(obspr[j], fprob, bprob)
 		normalizeSum(obspr[j], 0)
+
+		// Reverse polarity, not sure if the log is helpful or necessary.
 		for i := range obspr[j] {
 			obspr[j][i] = -math.Log(obspr[j][i])
 		}
@@ -257,7 +262,7 @@ func (hmm *MultiHMM) getValid(t int, obsgrp []int, obspr [][]float64, inds [][]i
 		ipa = ipa[0:nkp]
 	}
 
-	// The ipa values are position in the sorted probability lists.  Here we
+	// The ipa values are positions in the sorted probability lists.  Here we
 	// convert them to the actual state codes.
 	hmm.recodeToStates(ipa, inds)
 
