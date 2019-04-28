@@ -9,7 +9,38 @@ import (
 	"time"
 
 	"github.com/kshedden/multihmm/hmmlib"
+	"github.com/kshedden/multihmm/hmmsim"
 )
+
+// makeIntArray makes a collection of r slices
+// of length c, packed contiguously.
+func makeIntArray(r, c int) [][]int {
+
+	bka := make([]int, r*c)
+	x := make([][]int, r)
+	ii := 0
+	for j := 0; j < r; j++ {
+		x[j] = bka[ii : ii+c]
+		ii += c
+	}
+
+	return x
+}
+
+// makeFloatArray makes a collection of r slices
+// of length c, packed contiguously.
+func makeFloatArray(r, c int) [][]float64 {
+
+	bka := make([]float64, r*c)
+	x := make([][]float64, r)
+	ii := 0
+	for j := 0; j < r; j++ {
+		x[j] = bka[ii : ii+c]
+		ii += c
+	}
+
+	return x
+}
 
 func main() {
 
@@ -21,8 +52,9 @@ func main() {
 	var zeroinflated bool
 	flag.BoolVar(&zeroinflated, "zeroinflated", false, "Zero inflated")
 
-	var varpower float64
+	var varpower, snr float64
 	flag.Float64Var(&varpower, "varpower", 1.5, "Power variance for Tweedie")
+	flag.Float64Var(&snr, "snr", 8, "Signal-to-noise ratio")
 
 	var nParticleGrp, nState, nTime, nGroup int
 	flag.IntVar(&nParticleGrp, "nparticlegrp", 0, "Number of particles per group")
@@ -33,7 +65,7 @@ func main() {
 
 	rand.Seed(time.Now().UTC().UnixNano())
 
-	hmm := hmmlib.NewMulti(nParticleGrp*nGroup, nState, nTime)
+	hmm := hmmlib.NewMulti(nParticleGrp*nGroup, nState, nTime, hmmlib.NoCollisionConstraintMaker)
 
 	switch obsmodel {
 	case "gaussian":
@@ -94,17 +126,17 @@ func main() {
 			switch hmm.ObsModelForm {
 			case hmmlib.Gaussian:
 				if i == j {
-					hmm.Mean[i*nState+j] = 1
+					hmm.Mean[i*nState+j] = snr
 				}
 			case hmmlib.Poisson:
 				if i == j {
-					hmm.Mean[i*nState+j] = 8
+					hmm.Mean[i*nState+j] = snr
 				} else {
 					hmm.Mean[i*nState+j] = 1
 				}
 			case hmmlib.Tweedie:
 				if i == j {
-					hmm.Mean[i*nState+j] = 8
+					hmm.Mean[i*nState+j] = snr
 				} else {
 					hmm.Mean[i*nState+j] = 1
 				}
@@ -138,8 +170,8 @@ func main() {
 		}
 	}
 
-	hmm.GenStatesMulti()
-	hmm.GenObs()
+	hmmsim.GenStatesMulti(hmm)
+	hmmsim.GenObs(&hmm.HMM)
 
 	fid, err := os.Create("tmp.gob.gz")
 	if err != nil {

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"os"
 	"sort"
 	"sync"
@@ -13,27 +12,86 @@ import (
 	"gonum.org/v1/gonum/floats"
 )
 
+// ConstraintFunc is a function that returns 0 if the constraint is met and
+// a positive number otherwise.  The first argument to the constraint function
+// is the state vector being tested.  The second argument is a mask -- if mask[j]
+// is true, then state[j] is ignored in the constraint test.
+type ConstraintFunc func([]int, []bool) float64
+
+// ConstraintMaker generates a function that can test for state constraints.
+// A ConstraintMaker may return a closure that encloses workspace for the
+// constraint testing function.  Each returned ConstraintFunc created by the ConstraintMaker
+// will never be called concurrently.  The argument to ConstraintMaker
+// gives the actual states corresponding to the priority-sorted states
+// for each particle, i.e. inds[p][j] gives the actual state for the j^th
+// priority sorted state for particle p, where j=0 corresponds to the
+// highest priority state.
+type ConstraintMaker func([][]int) ConstraintFunc
+
 // MultiHMM is an HMM that can do joint Viterbi reconstruction of the state sequences.
 type MultiHMM struct {
 	HMM
+
+	// The constraint function that the joint states must satisfy.
+	ConstraintGen ConstraintMaker
 
 	// Group[k] lists all the particles that are reconstructed jointly
 	Group [][]int
 }
 
-// NewMulti returns a MultiHMM value with the given size parameters.
-func NewMulti(NParticle, NState, NTime int) *MultiHMM {
+// NoConstraintMaker returns a constraint function that always returns 0.
+func NoConstraintMaker(inds [][]int) ConstraintFunc {
+
+	return func(ix []int, mask []bool) float64 {
+		return 0
+	}
+}
+
+// NoCollisionConstraintMaker returns a constraint function that returns
+// zero if no two particles are in the same state, otherwise it returns
+// a positive number.
+func NoCollisionConstraintMaker(inds [][]int) ConstraintFunc {
+
+	p := len(inds)
+	wk := make([]int, p)
+
+	return func(ix []int, mask []bool) float64 {
+
+		wk = wk[0:0]
+		for pj, sj := range ix {
+			if !mask[pj] {
+				wk = append(wk, inds[pj][sj])
+			}
+		}
+		sort.IntSlice(wk).Sort()
+
+		v := 0
+		for j := 1; j < len(wk); j++ {
+			if wk[j] == wk[j-1] {
+				v++
+			}
+		}
+
+		return float64(v)
+	}
+}
+
+// NewMulti returns a MultiHMM value with the given size parameters and constraints.
+func NewMulti(NParticle, NState, NTime int, ConstraintGen ConstraintMaker) *MultiHMM {
 
 	hmm := New(NParticle, NState, NTime)
 
 	return &MultiHMM{
-		HMM: *hmm,
+		HMM:           *hmm,
+		ConstraintGen: ConstraintGen,
 	}
 }
 
 // InitializeMulti allocates workspaces for parameter estimation, so
 // that the multi-state Viterbi reconstruction can be applied.
 func (hmm *MultiHMM) InitializeMulti(nkp int) {
+
+	hmm.msglogger.Printf("Retaining %d joint states per time point in the reconstruction.", nkp)
 
 	if math.Log(float64(nkp)) > float64(hmm.NParticle)*math.Log(float64(hmm.NState)) {
 		msg := fmt.Sprintf("nkp (%d) is too large for NState (%d) and NParticle (%d)", nkp,
@@ -51,7 +109,7 @@ func (hmm *MultiHMM) InitializeMulti(nkp int) {
 	}
 
 	if float64(mx) >= 0.9*float64(hmm.NState) {
-		msg := "There are too many particles to do a collision-avoiding fit."
+		msg := "Warning: there may be too many particles to do a collision-avoiding fit."
 		_, _ = io.WriteString(os.Stderr, msg)
 	}
 }
@@ -82,62 +140,6 @@ func (hmm *MultiHMM) getMultiObsProb(t int, obsgrp []int, obspr [][]float64, ind
 		}
 
 		floats.Argsort(obspr[j], inds[j])
-	}
-}
-
-// GenStatesMulti creates a random state sequence in which
-// there are no collisions.
-func (hmm *MultiHMM) GenStatesMulti() {
-
-	ntime := hmm.NTime
-	hmm.State = makeIntArray(hmm.NParticle, hmm.NTime)
-	row := make([]float64, hmm.NState)
-
-	// Set the initial state
-	for p := 0; p < hmm.NParticle; p++ {
-		hmm.State[p][0] = genDiscrete(hmm.Init)
-	}
-
-	// Set the rest of the states
-	for t := 1; t < ntime; t++ {
-
-		for g := range hmm.Group {
-
-			// Try to avoid collisions within a group at the same time
-			check := make(map[int]bool)
-
-			for _, p := range hmm.Group[g] {
-
-				st0 := hmm.State[p][t-1]
-				copy(row, hmm.Trans[st0*hmm.NState:(st0+1)*hmm.NState])
-
-				for k := 0; ; k++ {
-					st := genDiscrete(row)
-
-					// Try 100 times to avoid a collision
-					if k < 100 && check[st] {
-						continue
-					}
-
-					hmm.State[p][t] = st
-					check[st] = true
-					break
-				}
-			}
-		}
-	}
-
-	// Mask
-	for p := 0; p < hmm.NParticle; p++ {
-		entry := rand.Int() % 100
-		for t := 0; t < entry; t++ {
-			hmm.State[p][t] = NullState
-		}
-
-		exit := 900 + (rand.Int() % 100)
-		for t := exit; t < hmm.NTime; t++ {
-			hmm.State[p][t] = NullState
-		}
 	}
 }
 
@@ -173,7 +175,6 @@ func (hmm *MultiHMM) getCaps(scores [][]float64, mask []bool, nkp int) []int {
 				continue
 			}
 			if caps[p] < hmm.NState {
-				// Should this be relative or absolute?
 				z := scores[p][caps[p]] - scores[p][0]
 				if first || z < lm {
 					lm = z
@@ -195,7 +196,8 @@ func (hmm *MultiHMM) getCaps(scores [][]float64, mask []bool, nkp int) []int {
 
 // getValid constructs an array of valid multistates in ascending score order for
 // time point t.  On exit, obspr will hold the negative observation probabilities.
-func (hmm *MultiHMM) getValid(t int, obsgrp []int, obspr [][]float64, inds [][]int, mask []bool, nkp int) []combiRec {
+func (hmm *MultiHMM) getValid(t int, obsgrp []int, obspr [][]float64, inds [][]int,
+	mask []bool, nkp int, constraint ConstraintFunc) []combiRec {
 
 	// obspr, inds, and mask are set here
 	hmm.getMultiObsProb(t, obsgrp, obspr, inds, mask)
@@ -217,33 +219,6 @@ func (hmm *MultiHMM) getValid(t int, obsgrp []int, obspr [][]float64, inds [][]i
 	// to find nkp multistates, so adjust accordingly.
 	if math.Log(float64(nkp)) > float64(ump)*math.Log(float64(hmm.NState)) {
 		nkp = int(math.Pow(float64(hmm.NState), float64(ump)))
-	}
-
-	nparticle := len(obsgrp)
-
-	// Workspace for constraint function.
-	wk := make([]int, nparticle)
-
-	// Make a constraint function that returns true if no two particles
-	// are in the same state.
-	constraint := func(ix []int, mask []bool) float64 {
-
-		wk = wk[0:0]
-		for pj, sj := range ix {
-			if !mask[pj] {
-				wk = append(wk, inds[pj][sj])
-			}
-		}
-		sort.IntSlice(wk).Sort()
-
-		v := 0
-		for j := 1; j < len(wk); j++ {
-			if wk[j] == wk[j-1] {
-				v++
-			}
-		}
-
-		return float64(v)
 	}
 
 	// Gradually raise the caps until we get enough points.
@@ -301,6 +276,7 @@ type rws struct {
 	npt []int
 }
 
+// newRws allocates a workspace for multistate reconstruction.
 func newRws(ntime, nkp int) *rws {
 	return &rws{
 		fpr: make([]float64, ntime*nkp),
@@ -336,7 +312,7 @@ func (hmm *MultiHMM) ReconstructMulti(nkp int) {
 	fmt.Printf("\n") // returns the prompt in the usual place
 }
 
-// traceback is the Viterbi traceback
+// traceback is the Viterbi traceback for joint state reconstruction
 func (hmm *MultiHMM) traceback(obsgrp []int, nkp int, ws *rws) {
 
 	fpr := ws.fpr
@@ -423,6 +399,8 @@ func (hmm *MultiHMM) multiprob(obsgrp []int, nkp int, ws *rws) {
 	obspr := makeFloatArray(nparticle, hmm.NState)
 	inds := makeIntArray(nparticle, hmm.NState)
 
+	constraint := hmm.ConstraintGen(inds)
+
 	// Calculate forward probabilities
 	j0 := -2 * nkp
 	jt := -nkp
@@ -431,7 +409,7 @@ func (hmm *MultiHMM) multiprob(obsgrp []int, nkp int, ws *rws) {
 		j0 += nkp
 		jt += nkp
 
-		ipa := hmm.getValid(t, obsgrp, obspr, inds, mask, nkp)
+		ipa := hmm.getValid(t, obsgrp, obspr, inds, mask, nkp, constraint)
 		npt[t] = len(ipa)
 
 		if npt[t] == 0 {
@@ -446,7 +424,7 @@ func (hmm *MultiHMM) multiprob(obsgrp []int, nkp int, ws *rws) {
 				lpg := 0.0
 				for pj, st := range cr.ix {
 					if !mask[pj] {
-						lpg += -math.Log(hmm.Init[st]) - hmm.GetLogObsProb(obsgrp[pj], t, st)
+						lpg += -math.Log(hmm.Init[st]) - hmm.GetLogObsProb(obsgrp[pj], t, st, false)
 					}
 				}
 
@@ -473,7 +451,7 @@ func (hmm *MultiHMM) multiprob(obsgrp []int, nkp int, ws *rws) {
 			for pj, st := range cr.ix {
 				// Can't use obspr here because it has been sorted
 				if !mask[pj] {
-					ltu -= hmm.GetLogObsProb(obsgrp[pj], t, st)
+					ltu -= hmm.GetLogObsProb(obsgrp[pj], t, st, false)
 				}
 			}
 

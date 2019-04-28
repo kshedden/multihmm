@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +17,8 @@ import (
 
 var (
 	logger *log.Logger
+
+	out io.WriteCloser
 
 	obsmodelnames = map[hmmlib.ObsModelType]string{
 		hmmlib.Gaussian: "gaussian",
@@ -26,6 +30,8 @@ var (
 		hmmlib.VarConst: "varconst",
 		hmmlib.VarFree:  "varfree",
 	}
+
+	constraint hmmlib.ConstraintMaker
 )
 
 type model struct {
@@ -41,6 +47,7 @@ type model struct {
 	logname      string
 	maxiter      int
 	nkp          int
+	snr          float64
 }
 
 var (
@@ -57,6 +64,7 @@ var (
 		logname:      "hmm",
 		maxiter:      20,
 		nkp:          200,
+		snr:          4,
 	}
 )
 
@@ -72,6 +80,7 @@ func generate(g *model) {
 		fmt.Sprintf("-ntime=%d", g.ntime),
 		fmt.Sprintf("-nstate=%d", g.nstate),
 		fmt.Sprintf("-outname=%s", g.gobfile),
+		fmt.Sprintf("-snr=%f", g.snr),
 	}
 
 	logger.Printf("go %s\n", strings.Join(c, " "))
@@ -84,12 +93,15 @@ func generate(g *model) {
 	}
 }
 
-func fit(g *model) {
+func fit(g *model, num int) {
+
+	logname := fmt.Sprintf("%s_%d", obsmodelnames[g.obsmodel], num)
 
 	c := []string{"run", "../estimate/main.go",
 		fmt.Sprintf("-maxiter=%d", g.maxiter),
 		fmt.Sprintf("-nkp=%d", g.nkp),
-		fmt.Sprintf("-logname=%s", g.logname),
+		fmt.Sprintf("-logname=%s", path.Join("logs", logname)),
+		fmt.Sprintf("-constraint=%s", "flexcollision"),
 		fmt.Sprintf("-gobfile=%s", g.gobfile),
 	}
 
@@ -102,7 +114,7 @@ func fit(g *model) {
 	}
 }
 
-func collect() {
+func collect() []int {
 
 	fid, err := os.Open("hmm_msg.log")
 	if err != nil {
@@ -113,6 +125,8 @@ func collect() {
 	scanner := bufio.NewScanner(fid)
 
 	ec := regexp.MustCompile(`(\d*)/(\d*) total errors`)
+
+	var nr []int
 
 	for scanner.Scan() {
 
@@ -132,26 +146,40 @@ func collect() {
 			panic(err)
 		}
 
-		fmt.Printf("numer=%d, denom=%d\n", numer, denom)
+		nr = append(nr, numer, denom)
 	}
+
+	return nr
 }
 
 func run(m *model) {
 
-	m.obsmodel = hmmlib.Poisson
-	m.zeroinflated = false
-	m.varpower = 1.5
+	mna := obsmodelnames[m.obsmodel]
+	vmna := varmodelnames[m.varmodel]
 
-	m.nkp = 10
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 10; i++ {
 		generate(m)
-		fit(m)
-		collect()
-		m.nkp += 20
+
+		for _, m.nkp = range []int{2, 5, 10, 20, 30, 40} {
+			fit(m, i)
+			nr := collect()
+			_, _ = io.WriteString(out, fmt.Sprintf("%s,%s,%.2f,%d,%d,%d,%d,%d\n",
+				mna, vmna, m.varpower, m.nkp, i, nr[0], nr[2], nr[3]))
+		}
 	}
 }
 
 func main() {
+
+	var err error
+	out, err = os.Create("result.csv")
+	if err != nil {
+		panic(err)
+	}
+	defer out.Close()
+
+	head := "EmissionModel,VarModel,VarPower,nkp,Run,ErrMarg,ErrJoint,Total\n"
+	_, _ = io.WriteString(out, head)
 
 	lfid, err := os.Create("sim.log")
 	if err != nil {
@@ -160,5 +188,17 @@ func main() {
 	defer lfid.Close()
 	logger = log.New(lfid, "", log.Ltime)
 
+	m := basemodel
+	m.obsmodel = hmmlib.Poisson
 	run(basemodel)
+
+	m = basemodel
+	m.obsmodel = hmmlib.Gaussian
+	run(basemodel)
+
+	m.obsmodel = hmmlib.Tweedie
+	for _, vp := range []float64{1.2, 1.4, 1.6, 1.8} {
+		m.varpower = vp
+		run(basemodel)
+	}
 }

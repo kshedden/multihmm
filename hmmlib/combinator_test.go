@@ -2,7 +2,6 @@ package hmmlib
 
 import (
 	"fmt"
-	"hash/fnv"
 	"math/rand"
 	"sort"
 	"testing"
@@ -24,6 +23,7 @@ func Test1(t *testing.T) {
 			},
 			caps: []int{2, 3, 2},
 			constraint: func(ix []int, mask []bool) float64 {
+				// Count number of repeated values
 				u := make([]int, len(ix))
 				copy(u, ix)
 				sort.IntSlice(u).Sort()
@@ -36,11 +36,11 @@ func Test1(t *testing.T) {
 				return m
 			},
 			expected: []combiRec{
-				{15, []int{2, 0, 1}},
 				{15, []int{1, 0, 2}},
-				{16, []int{2, 1, 0}},
 				{18, []int{0, 1, 2}},
+				{16, []int{2, 1, 0}},
 				{19, []int{1, 2, 0}},
+				{15, []int{2, 0, 1}},
 				{21, []int{0, 2, 1}},
 			},
 		},
@@ -75,18 +75,12 @@ func Test1(t *testing.T) {
 			},
 		},
 	} {
-		combi := &combinator{
-			scores:     p.scores,
-			constraint: p.constraint,
-			hash:       fnv.New64(),
-			mask:       make([]bool, len(p.scores)),
-		}
+		combi := NewCombinator(p.scores, p.constraint, make([]bool, len(p.scores)))
 
 		rand.Seed(6)
 		x := combi.enumerate(p.caps)
 
 		for i := range x {
-
 			if x[i].score != p.expected[i].score {
 				fmt.Printf("[A] pix=%d, i=%d\n", pix, i)
 				fmt.Printf("observed=%v\n", x)
