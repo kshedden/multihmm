@@ -37,7 +37,7 @@ func main() {
 
 	rand.Seed(time.Now().UTC().UnixNano())
 
-	hmm := hmmlib.NewMulti(nParticleGrp*nGroup, nState, nTime, hmmlib.NoCollisionConstraintMaker)
+	hmm := hmmlib.NewMulti(nParticleGrp*nGroup, nState, nTime, nState, hmmlib.NoCollisionConstraintMaker)
 
 	switch obsmodel {
 	case "gaussian":
@@ -61,8 +61,6 @@ func main() {
 			hmm.VarModel = hmmlib.VarConstByComponent
 		case "free":
 			hmm.VarModel = hmmlib.VarFree
-		case "diag":
-			hmm.VarModel = hmmlib.VarDiag
 		default:
 			panic(fmt.Sprintf("generate: unknown varmodel '%s'\n", varmodel))
 		}
@@ -170,16 +168,6 @@ func main() {
 			for i := 0; i < hmm.NState; i++ {
 				for j := 0; j < hmm.NState; j++ {
 					hmm.Std[i*hmm.NState+j] = 0.5 + float64(i)/float64(hmm.NState)
-				}
-			}
-		case hmmlib.VarDiag:
-			for i := 0; i < hmm.NState; i++ {
-				for j := 0; j < hmm.NState; j++ {
-					if i == j {
-						hmm.Std[i*hmm.NState+j] = 1.5
-					} else {
-						hmm.Std[i*hmm.NState+j] = 1
-					}
 				}
 			}
 		case hmmlib.VarFree:

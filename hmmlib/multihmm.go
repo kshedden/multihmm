@@ -77,9 +77,9 @@ func NoCollisionConstraintMaker(inds [][]int) ConstraintFunc {
 }
 
 // NewMulti returns a MultiHMM value with the given size parameters and constraints.
-func NewMulti(NParticle, NState, NTime int, ConstraintGen ConstraintMaker) *MultiHMM {
+func NewMulti(NParticle, NState, NTime, NComp int, ConstraintGen ConstraintMaker) *MultiHMM {
 
-	hmm := New(NParticle, NState, NTime)
+	hmm := New(NParticle, NState, NTime, NComp)
 
 	return &MultiHMM{
 		HMM:           *hmm,

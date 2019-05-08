@@ -112,8 +112,6 @@ func main() {
 			hmm.VarModel = hmmlib.VarConstByComponent
 		case "constbystate":
 			hmm.VarModel = hmmlib.VarConstByState
-		case "diag":
-			hmm.VarModel = hmmlib.VarDiag
 		default:
 			panic(fmt.Sprintf("estimate: unknown varmodel '%s'\n", *varmodel))
 		}
