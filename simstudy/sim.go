@@ -58,7 +58,7 @@ var (
 		varpower:     1.5,
 		ngroup:       20,
 		nparticlegrp: 10,
-		ntime:        1000,
+		ntime:        540,
 		nstate:       20,
 		gobfile:      "tmp.gob.gz",
 		logname:      "hmm",

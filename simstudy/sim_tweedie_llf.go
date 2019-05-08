@@ -14,6 +14,14 @@ import (
 	"strings"
 )
 
+const (
+	ngroup       = 20
+	nparticlegrp = 10
+	nstate       = 20
+	ntime        = 540
+	snr          = 3.0
+)
+
 var (
 	logger *log.Logger
 
@@ -24,13 +32,13 @@ func generate(pw float64) {
 
 	c := []string{"run", "../generate/main.go",
 		fmt.Sprintf("-obsmodel=%s", "tweedie"),
-		fmt.Sprintf("-ngroup=%d", 20),
+		fmt.Sprintf("-ngroup=%d", ngroup),
 		fmt.Sprintf("-varpower=%f", pw),
-		fmt.Sprintf("-nparticlegrp=%d", 10),
-		fmt.Sprintf("-ntime=%d", 1000),
-		fmt.Sprintf("-nstate=%d", 20),
-		fmt.Sprintf("-outname=%s", "tmp.gob.gz"),
-		fmt.Sprintf("-snr=%f", 4.0),
+		fmt.Sprintf("-nparticlegrp=%d", nparticlegrp),
+		fmt.Sprintf("-ntime=%d", ntime),
+		fmt.Sprintf("-nstate=%d", nstate),
+		fmt.Sprintf("-outname=%s", "tweedie_tmp.gob.gz"),
+		fmt.Sprintf("-snr=%f", snr),
 	}
 
 	logger.Printf("go %s\n", strings.Join(c, " "))
@@ -51,7 +59,7 @@ func fit(num int, pwt float64) string {
 		fmt.Sprintf("-maxiter=%d", 100),
 		fmt.Sprintf("-logname=%s", logname),
 		fmt.Sprintf("-varpower=%f", pwt),
-		fmt.Sprintf("-gobfile=%s", "tmp.gob.gz"),
+		fmt.Sprintf("-gobfile=%s", "tweedie_tmp.gob.gz"),
 		fmt.Sprintf("-reconstruct=%s", "false"),
 	}
 
@@ -76,7 +84,7 @@ func collect(logname string) float64 {
 
 	scanner := bufio.NewScanner(fid)
 
-	ec := regexp.MustCompile(`Final log-likelihood: ([\d-.]*)`)
+	ec := regexp.MustCompile(`Final AIC: ([\d-.]*)`)
 
 	for scanner.Scan() {
 
@@ -103,7 +111,7 @@ func run() {
 	ii := 0
 
 	for _, pwg := range pwl {
-		for i := 0; i < 2; i++ {
+		for i := 0; i < 5; i++ {
 			generate(pwg)
 			for _, pwt := range pwl {
 				logname := fit(i, pwt)

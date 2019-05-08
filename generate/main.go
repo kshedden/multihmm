@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"encoding/gob"
 	"flag"
+	"fmt"
 	"math/rand"
 	"os"
 	"time"
@@ -12,45 +13,16 @@ import (
 	"github.com/kshedden/multihmm/hmmsim"
 )
 
-// makeIntArray makes a collection of r slices
-// of length c, packed contiguously.
-func makeIntArray(r, c int) [][]int {
-
-	bka := make([]int, r*c)
-	x := make([][]int, r)
-	ii := 0
-	for j := 0; j < r; j++ {
-		x[j] = bka[ii : ii+c]
-		ii += c
-	}
-
-	return x
-}
-
-// makeFloatArray makes a collection of r slices
-// of length c, packed contiguously.
-func makeFloatArray(r, c int) [][]float64 {
-
-	bka := make([]float64, r*c)
-	x := make([][]float64, r)
-	ii := 0
-	for j := 0; j < r; j++ {
-		x[j] = bka[ii : ii+c]
-		ii += c
-	}
-
-	return x
-}
-
 func main() {
 
 	var obsmodel, varmodel, outname string
 	flag.StringVar(&obsmodel, "obsmodel", "gaussian", "Observation distribution")
 	flag.StringVar(&varmodel, "varmodel", "constant", "Variance model")
-	flag.StringVar(&outname, "outname", "", "Output file name prefix")
+	flag.StringVar(&outname, "outname", "", "Output file name")
 
-	var zeroinflated bool
+	var zeroinflated, masknull bool
 	flag.BoolVar(&zeroinflated, "zeroinflated", false, "Zero inflated")
+	flag.BoolVar(&masknull, "masknull", true, "Introduce null values at head and tail of sequence")
 
 	var varpower, snr float64
 	flag.Float64Var(&varpower, "varpower", 1.5, "Power variance for Tweedie")
@@ -69,19 +41,31 @@ func main() {
 
 	switch obsmodel {
 	case "gaussian":
-		hmm.ObsModelForm = hmmlib.Gaussian
+		hmm.ObsModel = hmmlib.Gaussian
 	case "poisson":
-		hmm.ObsModelForm = hmmlib.Poisson
+		hmm.ObsModel = hmmlib.Poisson
 	case "tweedie":
-		hmm.ObsModelForm = hmmlib.Tweedie
+		hmm.ObsModel = hmmlib.Tweedie
 		hmm.VarPower = varpower
+	default:
+		panic(fmt.Sprintf("generate: unknown obsmodel '%s'\n", obsmodel))
 	}
 
-	switch varmodel {
-	case "const":
-		hmm.VarForm = hmmlib.VarConst
-	case "free":
-		hmm.VarForm = hmmlib.VarFree
+	if hmm.ObsModel == hmmlib.Gaussian {
+		switch varmodel {
+		case "const":
+			hmm.VarModel = hmmlib.VarConst
+		case "constbystate":
+			hmm.VarModel = hmmlib.VarConstByState
+		case "constbycomponent":
+			hmm.VarModel = hmmlib.VarConstByComponent
+		case "free":
+			hmm.VarModel = hmmlib.VarFree
+		case "diag":
+			hmm.VarModel = hmmlib.VarDiag
+		default:
+			panic(fmt.Sprintf("generate: unknown varmodel '%s'\n", varmodel))
+		}
 	}
 
 	hmm.ZeroInflated = zeroinflated
@@ -102,13 +86,17 @@ func main() {
 
 	// Set the transition matrix
 	hmm.Trans = make([]float64, nState*nState)
-	for i := 0; i < nState; i++ {
-		p := 0.8 + 0.1*float64(i)/float64(nState-1)
-		for j := 0; j < nState; j++ {
-			if i == j {
-				hmm.Trans[i*nState+j] = p
-			} else {
-				hmm.Trans[i*nState+j] = (1 - p) / float64(nState-1)
+	if hmm.NState == 1 {
+		hmm.Trans = []float64{1}
+	} else {
+		for i := 0; i < nState; i++ {
+			p := 0.8 + 0.1*float64(i)/float64(nState-1)
+			for j := 0; j < nState; j++ {
+				if i == j {
+					hmm.Trans[i*nState+j] = p
+				} else {
+					hmm.Trans[i*nState+j] = (1 - p) / float64(nState-1)
+				}
 			}
 		}
 	}
@@ -123,7 +111,7 @@ func main() {
 	hmm.Mean = make([]float64, nState*nState)
 	for i := 0; i < nState; i++ {
 		for j := 0; j < nState; j++ {
-			switch hmm.ObsModelForm {
+			switch hmm.ObsModel {
 			case hmmlib.Gaussian:
 				if i == j {
 					hmm.Mean[i*nState+j] = snr
@@ -163,17 +151,52 @@ func main() {
 	}
 
 	// Set the standard deviations if needed
-	if hmm.ObsModelForm == hmmlib.Gaussian {
-		hmm.Std = make([]float64, nState*nState)
-		for i := 0; i < nState*nState; i++ {
-			hmm.Std[i] = 0.22
+	if hmm.ObsModel == hmmlib.Gaussian {
+		hmm.Std = make([]float64, hmm.NState*hmm.NState)
+		switch hmm.VarModel {
+		case hmmlib.VarConst:
+			for i := 0; i < hmm.NState; i++ {
+				for j := 0; j < hmm.NState; j++ {
+					hmm.Std[i*hmm.NState+j] = 1
+				}
+			}
+		case hmmlib.VarConstByState:
+			for i := 0; i < hmm.NState; i++ {
+				for j := 0; j < hmm.NState; j++ {
+					hmm.Std[i*hmm.NState+j] = 0.5 + float64(j)/float64(hmm.NState)
+				}
+			}
+		case hmmlib.VarConstByComponent:
+			for i := 0; i < hmm.NState; i++ {
+				for j := 0; j < hmm.NState; j++ {
+					hmm.Std[i*hmm.NState+j] = 0.5 + float64(i)/float64(hmm.NState)
+				}
+			}
+		case hmmlib.VarDiag:
+			for i := 0; i < hmm.NState; i++ {
+				for j := 0; j < hmm.NState; j++ {
+					if i == j {
+						hmm.Std[i*hmm.NState+j] = 1.5
+					} else {
+						hmm.Std[i*hmm.NState+j] = 1
+					}
+				}
+			}
+		case hmmlib.VarFree:
+			for i := 0; i < hmm.NState; i++ {
+				for j := 0; j < hmm.NState; j++ {
+					hmm.Std[i*hmm.NState+j] = 0.5 + float64(i*j)/float64((hmm.NState-1)*(hmm.NState-1))
+				}
+			}
+		default:
+			panic("Unkown variance model\n")
 		}
 	}
 
-	hmmsim.GenStatesMulti(hmm)
+	hmmsim.GenStatesMulti(hmm, masknull)
 	hmmsim.GenObs(&hmm.HMM)
 
-	fid, err := os.Create("tmp.gob.gz")
+	fid, err := os.Create(outname)
 	if err != nil {
 		panic(err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -74,7 +75,10 @@ func main() {
 	maxiter := flag.Int("maxiter", 20, "Maximum number of iterations")
 	constraint := flag.String("constraint", "", "Type of state constraint")
 	reconstruct := flag.Bool("reconstruct", true, "If false, do not reconstruct states")
-	varpower := flag.Float64("varpower", 0, "Override varpower in HMM gob file")
+	obsmodel := flag.String("obsmodel", "", "Override obsmodel in HMM gob file")
+	varmodel := flag.String("varmodel", "", "Override varmodel in HMM gob file")
+	varpower := flag.Float64("varpower", -1, "Override varpower in HMM gob file")
+	zeroinflated := flag.Int("zeroinflated", -1, "Override zeroinflated in HMM gob file")
 	flag.Parse()
 
 	if *gobname == "" {
@@ -84,6 +88,51 @@ func main() {
 
 	hmm := hmmlib.ReadHMM(*gobname)
 	logger = hmm.SetLogger(*logname)
+
+	if *obsmodel != "" {
+		switch *obsmodel {
+		case "gaussian":
+			hmm.ObsModel = hmmlib.Gaussian
+		case "poisson":
+			hmm.ObsModel = hmmlib.Poisson
+		case "tweedie":
+			hmm.ObsModel = hmmlib.Tweedie
+		default:
+			panic(fmt.Sprintf("estimate: unknown obsmodel %s", *obsmodel))
+		}
+	}
+
+	if *varmodel != "" {
+		switch *varmodel {
+		case "const":
+			hmm.VarModel = hmmlib.VarConst
+		case "free":
+			hmm.VarModel = hmmlib.VarFree
+		case "constbycomponent":
+			hmm.VarModel = hmmlib.VarConstByComponent
+		case "constbystate":
+			hmm.VarModel = hmmlib.VarConstByState
+		case "diag":
+			hmm.VarModel = hmmlib.VarDiag
+		default:
+			panic(fmt.Sprintf("estimate: unknown varmodel '%s'\n", *varmodel))
+		}
+	}
+
+	if *varpower != -1 {
+		hmm.VarPower = *varpower
+	}
+
+	if *zeroinflated != -1 {
+		switch *zeroinflated {
+		case 0:
+			hmm.ZeroInflated = false
+		case 1:
+			hmm.ZeroInflated = true
+		default:
+			panic("unknown zeroinflated value")
+		}
+	}
 
 	switch *constraint {
 	case "nocollision":
@@ -112,6 +161,7 @@ func main() {
 	hmm.WriteSummary(nil, "Estimated parameters:")
 
 	logger.Printf("Final log-likelihood: %f", hmm.Loglike())
+	logger.Printf("Final AIC: %f", hmm.AIC())
 
 	if !*reconstruct {
 		return

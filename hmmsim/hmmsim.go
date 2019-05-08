@@ -54,7 +54,7 @@ func GenObs(hmm *hmmlib.HMM) {
 				}
 			} else {
 				for j := 0; j < hmm.NState; j++ {
-					switch hmm.ObsModelForm {
+					switch hmm.ObsModel {
 					case hmmlib.Gaussian:
 						if hmm.ZeroInflated && rand.Float64() < hmm.Zprob[ip+j] {
 							hmm.Obs[p][t*hmm.NState+j] = 0
@@ -94,7 +94,7 @@ func genDiscrete(pr []float64) int {
 
 // GenStatesMulti creates a random state sequence in which
 // there are no collisions.
-func GenStatesMulti(hmm *hmmlib.MultiHMM) {
+func GenStatesMulti(hmm *hmmlib.MultiHMM, mask bool) {
 
 	row := make([]float64, hmm.NState)
 	hmm.State = makeIntArray(hmm.NParticle, hmm.NTime)
@@ -142,9 +142,16 @@ func GenStatesMulti(hmm *hmmlib.MultiHMM) {
 		}
 	}
 
+	if !mask {
+		return
+	}
+
 	// Mask
 	for p := 0; p < hmm.NParticle; p++ {
 		entry := rand.Int() % 100
+		if entry > hmm.NTime {
+			entry = rand.Int() % (hmm.NTime / 10)
+		}
 		for t := 0; t < entry; t++ {
 			hmm.State[p][t] = hmmlib.NullState
 		}
